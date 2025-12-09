@@ -1,3 +1,123 @@
+# pem_mdc_analyze.jl 
+#
+# Usage:
+#   julia --project pem_mdc_analyze.jl path_to_OUTROOT [delta_frac] [seed] [seed_end]
+#   OUTROOT is output directory created by pem_mdc_train.jl
+#   Examples:
+#     julia --project pem_mdc_analyze.jl path_to_OUTROOT 0.01 2
+#     julia --project pem_mdc_analyze.jl path_to_OUTROOT 0.01 1 10
+
+include("pem_mdc_train.jl")   
+
+using CSV, DataFrames, Statistics, Printf
+using ComponentArrays
+using Optimization, OptimizationOptimJL, Optim
+#using DifferentialEquations, SciMLSensitivity
+using OrdinaryDiffEq, SciMLSensitivity
+using Plots
+import GR
+
+
+# Pure MSE (mean) from the already-saved predictions CSV of a seed
+function baseline_mse_from_csv(run_dir::AbstractString)
+    pred = CSV.read(joinpath(run_dir, "predictions_final.csv"), DataFrame)
+    states = ["Never","Exposed","Presymptomatic","Symptomatic","Asymptomatic","Deaths"]
+    diffs2 = Float64[]
+    for s in states
+        oc = Symbol(s*"_obs"); pc = Symbol(s*"_pred")
+        if (oc in propertynames(pred)) && (pc in propertynames(pred))
+            y  = collect(skipmissing(pred[!, oc]))
+            ŷ  = collect(skipmissing(pred[!, pc]))
+            n  = min(length(y), length(ŷ))
+            append!(diffs2, (y[1:n] .- ŷ[1:n]).^2)
+        end
+    end
+    @assert !isempty(diffs2) "No *_obs/*_pred pairs found in predictions_final.csv for $run_dir"
+    return mean(diffs2)  # pure MSE, no regularizer
+end
+
+# Build observed data matrix (6×T) from the same CSV
+function observed_matrix_from_csv(run_dir::AbstractString)
+    pred = CSV.read(joinpath(run_dir, "predictions_final.csv"), DataFrame)
+    states = ["Never","Exposed","Presymptomatic","Symptomatic","Asymptomatic","Deaths"]
+    cols = Vector{Vector{Float64}}()
+    for s in states
+        oc = Symbol(s*"_obs")
+        @assert oc in propertynames(pred) "Missing column $(oc) in predictions_final.csv"
+        push!(cols, collect(skipmissing(pred[!, oc])))
+    end
+    # Stack rows as states (6×T)
+    return reduce(hcat, cols)
+end
+
+# Robust normalized RMS curve distance with epsilon guard
+curve_distance_norm(kappa_base::AbstractVector, kappa_tilde::AbstractVector) = begin
+    @assert length(kappa_base) == length(kappa_tilde)
+    w   = 1.0 / length(kappa_base)
+    num = sqrt(sum(w .* (kappa_tilde .- kappa_base).^2))
+    den = sqrt(sum(w .* (kappa_base.^2))) + 1e-12
+    num / den
+end
+
+# Lean ODE solve (fix to test? memory-friendly, need to check if it works well on macOS?)
+lean_solve(prob, tdata) = solve(prob, Tsit5();
+    saveat          = tdata,
+    save_everystep  = false,
+    save_start      = false,
+    save_end        = true,
+    dense           = false,
+    save_idxs       = 1:6,
+    sensealg        = QuadratureAdjoint(autojacvec = ZygoteVJP())
+)
+
+# MDC loss: PURE MSE (mean), using lean solve
+function pem_loss_md(p_var; prob_md, tdata, data_mat)
+    sol  = lean_solve(remake(prob_md, p=p_var), tdata)
+    pred = Array(sol)  # 6×T
+    L    = mean((data_mat .- pred).^2)
+    sol = nothing; pred = nothing
+    return L
+end
+
+# Obtain baseline κ grid robustly (md.κ_grid or md.kappa_grid)
+function baseline_kappa_grid(md)
+    if hasproperty(md, Symbol("κ_grid"))
+        return getfield(md, Symbol("κ_grid"))
+    elseif hasproperty(md, :kappa_grid)
+        return getfield(md, :kappa_grid)
+    else
+        error("md.κ_grid (or md.kappa_grid) not found in MDC context")
+    end
+end
+
+# MDC runner
+# CLI 
+if abspath(PROGRAM_FILE) == @__FILE__
+    if length(ARGS) == 0
+        println("Usage: julia --project pem_mdc_train.jl OUTROOT [delta_frac] [seed] [seed_end]")
+        println("Examples:")
+        println("  julia --project pem_mdc_train.jl path_to_OUTROOT")
+        println("  julia --project pem_mdc_train.jl path_to_OUTROOT 0.01 2")
+        println("  julia --project pem_mdc_train.jl path_to_OUTROOT 0.01 1 10")
+        exit(1)
+    end
+    outroot    = ARGS[1]
+    delta_frac = length(ARGS) >= 2 ? parse(Float64, ARGS[2]) : 0.01
+    if length(ARGS) >= 4
+        s1 = parse(Int, ARGS[3]); s2 = parse(Int, ARGS[4])
+        for s in s1:s2
+            try
+                run_mdcurve_for_seed(s; outroot=outroot, delta_frac=delta_frac)
+            catch e
+                @warn "MDC failed for seed $s" exception=(e, catch_backtrace())
+            end
+        end
+    else
+        seed = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 1
+        run_mdcurve_for_seed(seed; outroot=outroot, delta_frac=delta_frac)
+    end
+end
+vm@vm-Inspiron-15-3511:~/abm_ude$ cat pem_mdc_train.jl
 # pem_mdc_train.jl
 #
 # Example usage:
@@ -29,13 +149,14 @@ include("utils_1NN.jl")
 # Config
 const MODEL_NAME     = "SEInsIsIaDR"
 
-const ADAM_maxiters  = 15
-const LBFGS_maxiters = 5
-const N_RUNS         = 1 # change to 10 ensemble
+# use ths for smoke test
+#const ADAM_maxiters  = 15
+#const LBFGS_maxiters = 5
+#const N_RUNS         = 5 
 
-#const ADAM_maxiters  = 1500
-#const LBFGS_maxiters = 500
-#const N_RUNS         = 1 # change to 10 ensemble
+const ADAM_maxiters  = 1500
+const LBFGS_maxiters = 500
+const N_RUNS         = 1 # change to 10 ensemble
 
 const SCRIPT_NAME = splitext(basename(PROGRAM_FILE))[1]
 const OUTROOT_BASE = SCRIPT_NAME
@@ -65,9 +186,9 @@ u0_6 = u0_norm   .* max_vals            # 6
 
 # Recovered initial guess (from df if available; else 0)
 R0_guess = hasproperty(df, :Immune) ? Float64(df[1, :Immune]) : 0.0
-N0 = sum(u0_6) + R0_guess               # total incl. R, excl. D in denominator where needed
+N0 = sum(u0_6) + R0_guess  # total incl. R, excl. D in denominator where needed
 R0 = max(R0_guess, (N0 - u0_6[end]) - sum(u0_6[1:5]))  # ensure nonnegative
-u0 = vcat(u0_6, R0)  # 7 states: S,E,Ins,Is,Ia,D,R
+u0 = vcat(u0_6, R0)  
 
 # Interpolator y(t) for the observed 6 states (original scale)
 function make_linear_interpolator(tgrid::AbstractVector, Y::AbstractMatrix)
@@ -83,7 +204,6 @@ function make_linear_interpolator(tgrid::AbstractVector, Y::AbstractMatrix)
 end
 const y_of_t = make_linear_interpolator(tdata, data)  # 6-vector
 
-# Utilities: saving, metrics
 function save_predictions_csv(sol_arr::AbstractArray, tdata::AbstractVector, data_arr::AbstractArray;
                               outdir::AbstractString = "PEM_UDE_KAPPA_OG__csv", tag::AbstractString = "")
     mkpath(outdir)
@@ -262,7 +382,8 @@ function train_once(seed::Int; outroot::String=OUTROOT)
     pred_final = Array(sol_final)[1:6, :]
 
     # (MDC): save baseline checkpoint for identifiability
-    JLD2.@save joinpath(run_dir, "baseline_checkpoint.jld2") p_final sol_final L_star=lbfgs_loss
+    #JLD2.@save joinpath(run_dir, "baseline_checkpoint.jld2") p_final sol_final L_star=lbfgs_loss
+    JLD2.@save joinpath(run_dir, "baseline_checkpoint.jld2") p_final L_star=lbfgs_loss u0=prob_local.u0 tspan=prob_local.tspan
 
     # Save per-run predictions
     save_predictions_csv(pred_final, tdata, data; outdir=run_dir, tag="final")
@@ -307,9 +428,9 @@ function run_ensemble(; N::Int=N_RUNS, outroot::String=OUTROOT)
     @threads for i in 1:N
         seed = i
         try
-            println(">>> Starting run $seed on thread $(threadid()) at $(Dates.now())")
+            println("##### Starting run $seed on thread $(threadid()) at $(Dates.now())")
             results[i] = train_once(seed; outroot=outroot)  # NO plotting in threads
-            println("<<< FINISHED run $seed on thread $(threadid()) at $(Dates.now())")
+            println("##### FINISHED run $seed on thread $(threadid()) at $(Dates.now())")
         catch e
             @warn "Run $seed failed" error=e
             results[i] = FitMetrics(NaN, NaN, NaN, fill(NaN, 6), seed, NaN, NaN, NaN, :Failure)
@@ -367,7 +488,7 @@ function generate_plots(; outroot::String=OUTROOT, N::Int=N_RUNS)
     for seed in 1:N
         run_dir = joinpath(outroot, "run_$(seed)")
 
-        # 1) Obs vs pred per state
+        # Obs vs pred per state
         pred_path = joinpath(run_dir, "predictions_final.csv")
         if isfile(pred_path)
             df = CSV.read(pred_path, DataFrame)
@@ -473,15 +594,26 @@ function make_delta_head(rng::AbstractRNG)
     return nnΔ, stΔ, p_md0
 end
 
-# PATCH: build_mdcurve (MSE-consistent budget) 
+# build_mdcurve (MSE-consistent budget) 
 function build_mdcurve(seed::Int, run_dir::String, built; delta_frac::Float64=0.01)
     ckpt_path = joinpath(run_dir, "baseline_checkpoint.jld2")
     @assert isfile(ckpt_path) "Missing baseline_checkpoint.jld2 in $run_dir. Run training for this seed first."
-    # Original checkpoint fields (unchanged):
-    JLD2.@load ckpt_path p_final sol_final L_star   # L_star = training loss incl. regularizer  (kept for reference)  [see train_once save]  
+    #
+    # Error 
+    # JLD2.@load ckpt_path p_final sol_final L_star   # L_star = training loss incl. regularizer  (kept for reference)  [see train_once save]  
     # Compute consistent baseline MSE from the saved baseline solution (pred vs data):
     # use MSE-only as the baseline for MDC budget & Δloss%
+    #pred0 = Array(sol_final)[1:6, :]
+
+
+    # NEW WORKING CODE
+    JLD2.@load ckpt_path p_final L_star # removed sol_final
+    prob_base = remake(built.prob_local, p=p_final)
+    sol_final = solve(prob_base, Tsit5(); saveat=built.prob_local.kwargs[:saveat])
+
     pred0 = Array(sol_final)[1:6, :]
+
+
     L_star_mse = mean(abs2.(data .- pred0))
 
     nnκ  = built.nn_kappa_local
@@ -591,7 +723,8 @@ function build_mdcurve(seed::Int, run_dir::String, built; delta_frac::Float64=0.
     end
 
     # also return L_star_mse for downstream CSV and Δloss% calculations
-    return (; objective, p_var0, κ_grid, kappa_tilde_on_grid, L_star, L_star_mse, L_budget)
+    #return (; objective, p_var0, κ_grid, kappa_tilde_on_grid, L_star, L_star_mse, L_budget)
+    return (; objective, p_var0, κ_grid, kappa_tilde_on_grid, L_star, L_star_mse, L_budget, prob_md, tdata)
 end
 
 # Construct the MDC problem for a seed using its baseline checkpoint
@@ -698,7 +831,7 @@ function build_mdcurve_old(seed::Int, run_dir::String, built; delta_frac::Float6
         return mean(abs2.(data .- pred))
     end
 
-    # Implement the correct MDC objective ---
+    # Implement the correct MDC objective 
     # The new objective (gap^2 - λ*D) forces the optimizer to
     # stay AT the loss budget (minimizing gap^2) and spend its
     # effort maximizing the distance (by minimizing -λ*D).
@@ -719,7 +852,6 @@ function build_mdcurve_old(seed::Int, run_dir::String, built; delta_frac::Float6
     return (; objective, p_var0, κ_grid, kappa_tilde_on_grid, L_star, L_budget)
 end
 
-# PATCH: run_mdcurve_for_seed (axes fix + Δloss% vs MSE)
 function run_mdcurve_for_seed(seed::Int; outroot::String=OUTROOT, delta_frac::Float64=0.01)
     run_dir = joinpath(outroot, "run_$(seed)")
     @assert isdir(run_dir) "No directory $run_dir. Train seed $seed first."
@@ -833,7 +965,7 @@ function main()
     generate_plots(; outroot=OUTROOT, N=N_RUNS)
 
 
-    # (MDC): run minimally disruptive curve on the best seed ---
+    # (MDC): run minimally disruptive curve on the best seed
     try
         run_mdcurve_on_best(; outroot=OUTROOT, delta_frac=0.01)  # 1% budget
     catch e
@@ -845,4 +977,3 @@ end
 if abspath(PROGRAM_FILE) == @__FILE__
     main()
 end
-
