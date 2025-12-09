@@ -12,8 +12,10 @@ include("pem_mdc_train.jl")
 using CSV, DataFrames, Statistics, Printf
 using ComponentArrays
 using Optimization, OptimizationOptimJL, Optim
-using DifferentialEquations, SciMLSensitivity
+#using DifferentialEquations, SciMLSensitivity
+using OrdinaryDiffEq, SciMLSensitivity
 using Plots
+import GR
 
 
 # Pure MSE (mean) from the already-saved predictions CSV of a seed
@@ -88,80 +90,8 @@ function baseline_kappa_grid(md)
     end
 end
 
-# MDC runner 
-"""
-    run_mdcurve_for_seed(seed; outroot, delta_frac=0.01, λ=1.0, maxiters=7000)
-
-Run the minimally disruptive κ test **without retraining**, writing:
-  - run_<seed>/mdcurve_summary.csv
-  - run_<seed>/mdcurve_kappa_overlay.png
-"""
-function run_mdcurve_for_seed(seed::Integer; outroot::AbstractString,
-                              delta_frac::Float64=0.01, λ::Float64=1.0, maxiters::Int=7000)
-
-    run_dir = joinpath(outroot, "run_$(seed)")
-    @assert isdir(run_dir) "Run directory not found: $run_dir"
-
-    # Baseline pure-MSE loss and budget
-    L_star_mse = baseline_mse_from_csv(run_dir)
-    L_budget   = (1 + delta_frac) * L_star_mse
-    @info "[MDC seed=$(seed)] baseline MSE = $(L_star_mse), δ=$(round(100*delta_frac,digits=2))%, budget = $(L_budget)"
-
-    # Build MDC context via your existing code
-    built  = build_run(seed)                                  # from your file
-    md     = build_mdcurve(seed, run_dir, built; delta_frac=delta_frac)
-    prob_md, tdata = md.prob_md, md.tdata
-    data_mat = observed_matrix_from_csv(run_dir)              # 6×T
-    kbase    = baseline_kappa_grid(md)
-
-    # Budget-centered objective
-    function obj(u, p)
-        p_var = ComponentArray(u, getaxes(md.p_var0))
-        L_alt = pem_loss_md(p_var; prob_md=prob_md, tdata=tdata, data_mat=data_mat)
-        κ̃    = md.kappa_tilde_on_grid(p_var)
-        D     = curve_distance_norm(kbase, κ̃)
-        J     = (L_alt - L_budget)^2 - λ * D
-        return J
-    end
-
-    optf  = Optimization.OptimizationFunction(obj, Optimization.AutoZygote())
-    prob  = Optimization.OptimizationProblem(optf, md.p0_vec, nothing)
-    res   = Optimization.solve(prob, LBFGS(linesearch=BackTracking());
-                               maxiters=maxiters, store_trace=false, show_trace=false)
-
-    # Final metrics
-    p_opt = ComponentArray(res.u, getaxes(md.p_var0))
-    L_alt = pem_loss_md(p_opt; prob_md=prob_md, tdata=tdata, data_mat=data_mat)
-    κ̃    = md.kappa_tilde_on_grid(p_opt)
-    dist  = curve_distance_norm(kbase, κ̃)
-    Δloss = 100 * (L_alt - L_star_mse) / max(L_star_mse, 1e-12)
-
-    # Warn if we drifted too far from the budget shell
-    if abs(L_alt - L_budget) / max(L_budget, 1e-12) > 0.02
-        @warn "[MDC seed=$(seed)] Final loss off budget (>2% of L*): L_alt=$(L_alt), L_budget=$(L_budget)"
-    end
-
-    # Overlay plot (close figure to free memory)
-    plt = plot(tdata, kbase, label="κ baseline")
-    plot!(plt, tdata, κ̃, label="κ̃ (min-disrupt)", linestyle=:dash)
-    ann = @sprintf "(MSE) Δloss ≈ %.2f%% | Δκ_norm = %.4f", Δloss, dist
-    annotate!(plt, (tdata[1], maximum(vcat(kbase, κ̃))), text(ann, 8, :left))
-    xlabel!("time"); ylabel!("κ"); title!("Seed $seed – minimally disruptive κ")
-    savefig(plt, joinpath(run_dir, "mdcurve_kappa_overlay.png"))
-    close(plt); try; import GR; GR.clearws(); catch; end
-
-    # Consistent summary CSV
-    CSV.write(joinpath(run_dir, "mdcurve_summary.csv"),
-              DataFrame(; seed=seed,
-                         L_star=L_star_mse, L_alt=L_alt,
-                         rel_dloss_percent=Δloss,
-                         norm_curve_distance=dist))
-    @info "[MDC seed=$(seed)] Δloss%=$(round(Δloss,digits=3)), Δκ_norm=$(round(dist,digits=6))"
-    return nothing
-end
-
-# CLI / Main guard 
-
+# MDC runner
+# CLI 
 if abspath(PROGRAM_FILE) == @__FILE__
     if length(ARGS) == 0
         println("Usage: julia --project pem_mdc_train.jl OUTROOT [delta_frac] [seed] [seed_end]")
